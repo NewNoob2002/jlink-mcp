@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Unified J-Link GDB Server startup and teardown between the VS Code extension
+  and MCP backend through `GDBServerManager`.
+- `start_debug_session` now starts the server, attaches GDB, resumes the target,
+  and only then connects RTT. GDB session failures are returned to the caller.
+- Stopping a GDB Server disconnects the GDB client and RTT before releasing the
+  probe.
+- Serialized backend access and protected `ProcessManager` entries from stale
+  child-process callbacks deleting a replacement process.
+- Declared GDB transport in status output: TCP for J-Link/OpenOCD and serial for
+  Black Magic Probe.
+- Unified RTT connection state updates and surfaced RTT recovery results.
+- Failed session startup now releases a server started by that attempt instead
+  of leaving the probe occupied after a GDB attach failure.
+
 ## 0.7.0
 
 Three rounds of pointing a fresh agent at real hardware and reading its

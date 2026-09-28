@@ -13,7 +13,7 @@ npm run compile
 ## Testing
 
 ```bash
-npm test          # unit tier: ~187 tests, seconds, no hardware
+npm test          # unit tier: 321 tests, seconds, no hardware
 npm run test:hil  # hardware tier: needs HIL=1 and a real probe; skips otherwise
 ```
 
@@ -65,7 +65,7 @@ JLINK_DEVICE=nRF5340_xxAA_APP node out/mcp/standalone.js
 ```
 
 Env vars: `JLINK_DEVICE`, `JLINK_INSTALL_DIR`, `JLINK_INTERFACE`, `JLINK_SPEED`,
-`JLINK_SERIAL`, `JLINK_GDB_PORT`, `JLINK_RTT_PORT`.
+`JLINK_SERIAL`, `JLINK_GDB_PORT`, `JLINK_RTT_PORT`, `JLINK_RTT_ADDR`.
 
 ## MCP Configuration (manual, for Claude Desktop / Claude Code)
 
@@ -85,16 +85,18 @@ Env vars: `JLINK_DEVICE`, `JLINK_INSTALL_DIR`, `JLINK_INTERFACE`, `JLINK_SPEED`,
 ## Architecture
 
 - `src/jlink/commander.ts` - J-Link Commander (JLinkExe) wrapper with output parsing
-- `src/jlink/gdb-server.ts` - JLinkGDBServer lifecycle management
+- `src/jlink/gdb-server.ts` - shared J-Link GDBServer lifecycle management for the extension and MCP backend
+- `src/gdb/gdb-client.ts` - persistent GDB/MI client and serialized command queue
 - `src/rtt/rtt-client.ts` - RTT telnet client with ANSI stripping and Zephyr log parsing
 - `src/telnet/telnet-proxy.ts` - TCP proxy for Trice/Pigweed detokenizer
-- `src/mcp/server.ts` - MCP server: 47 tools, 4 resources, 4 prompts
+- `src/mcp/server.ts` - MCP server: 47 tools, 3 resources, 4 prompts
 - `src/mcp/standalone.ts` - Standalone entry point (stdio transport, env var config)
 - `src/extension.ts` - VSCode extension: MCP provider, commands, status bar, output channels
 
 ## Key tools for LLMs
 
-- `start_debug_session` - One-call GDB + RTT setup, returns boot log
+- `start_debug_session` - One-call setup in the order GDB server → GDB client → resume → RTT, returns boot log
+- `gdb_server_stop` - Disconnects GDB client and RTT before stopping the server and releasing the probe
 - `snapshot` - Full device state (regs + faults + stack + RTT) in one call
 - `diagnose_crash` - Auto-decode ARM Cortex-M fault registers
 - `rtt_search` - Filter RTT logs by level/module/regex

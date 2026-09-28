@@ -192,7 +192,7 @@ searches all 9800 that J-Link supports, by part number, manufacturer, or core.
 
 | Tool | Description |
 |------|-------------|
-| `start_debug_session` | **One-call setup.** Starts GDB server + connects RTT + returns boot log. |
+| `start_debug_session` | **One-call setup.** Starts the GDB server, attaches the GDB client, resumes the target, connects RTT, and returns boot output. A failed GDB client attach is reported as a failed session. |
 | `snapshot` | Captures full device state: registers, fault status, stack dump, RTT output. |
 | `diagnose_crash` | Auto-reads and decodes ARM Cortex-M fault registers (CFSR, HFSR, MMFAR, BFAR) with exception stack frame. |
 
@@ -252,9 +252,9 @@ as `svdFile`. Vendors publish one per part.
 
 | Tool | Description |
 |------|-------------|
-| `gdb_server_start` | Start probe's GDB server |
-| `gdb_server_stop` | Stop GDB server + disconnect RTT |
-| `gdb_server_status` | GDB server, RTT, and proxy status |
+| `gdb_server_start` | Start the probe's GDB server and attach the MCP GDB client when the transport is TCP |
+| `gdb_server_stop` | Clear debug state, disconnect the GDB client and RTT, then stop the GDB server |
+| `gdb_server_status` | GDB server, transport, RTT, and proxy status |
 
 ### Source-Level Debugging
 
@@ -345,12 +345,12 @@ gives them, and that a symbols-only load does not reprogram the device.
 
 jlink-mcp supports multiple debug probe backends through a common `ProbeBackend` abstraction:
 
-| Backend | Probe Hardware | Status | RTT Support |
-|---------|---------------|--------|-------------|
-| **J-Link** | SEGGER J-Link, J-Link OB, J-Link EDU | Production | Yes |
-| **OpenOCD** | ST-Link, CMSIS-DAP, FTDI, J-Link (via OpenOCD) | Beta | No |
-| **Black Magic Probe** | BMP (built-in GDB server on serial) | Beta | No |
-| **probe-rs** | All probe-rs supported probes | Planned | Planned |
+| Backend | Probe Hardware | GDB transport | Status | RTT Support |
+|---------|---------------|---------------|--------|-------------|
+| **J-Link** | SEGGER J-Link, J-Link OB, J-Link EDU | TCP | Production | Yes |
+| **OpenOCD** | ST-Link, CMSIS-DAP, FTDI, J-Link (via OpenOCD) | TCP | Beta | No |
+| **Black Magic Probe** | BMP built-in GDB server | Serial | Beta | No |
+| **probe-rs** | All probe-rs supported probes | — | Planned | Planned |
 
 ### Selecting a Backend
 
@@ -382,7 +382,7 @@ PROBE_TYPE=blackmagic \
 │                  jlink-mcp                           │
 │                                                      │
 │  ┌──────────┐  ┌──────────┐  ┌───────────────────┐  │
-│  │ 31 Tools │  │4 Resources│  │    4 Prompts      │  │
+│  │ 47 Tools │  │3 Resources│  │    4 Prompts      │  │
 │  └────┬─────┘  └────┬─────┘  └───────┬───────────┘  │
 │       │              │                │              │
 │  ┌────▼──────────────▼────────────────▼───────────┐  │
@@ -414,8 +414,12 @@ src/
 │   ├── blackmagic.ts   # Black Magic Probe implementation
 │   └── factory.ts      # Probe creation from config
 ├── mcp/
-│   ├── server.ts       # MCP server (45 tools, 4 resources, 4 prompts)
+│   ├── server.ts       # MCP server (47 tools, 3 resources, 4 prompts)
 │   └── standalone.ts   # Standalone entry (stdio transport)
+├── jlink/
+│   └── gdb-server.ts   # Shared J-Link GDB Server lifecycle
+├── gdb/
+│   └── gdb-client.ts   # Persistent GDB/MI client
 ├── rtt/
 │   └── rtt-client.ts   # RTT client with ANSI stripping + Zephyr log parsing
 ├── telnet/
@@ -472,6 +476,10 @@ Both captured from the same board. The rest of the design follows the same rule
 - **FP registers** only shown if non-zero (they're usually all zeros).
 - **RTT output** has ANSI escape codes stripped and Zephyr log format parsed into structured fields.
 - **Composite tools** (`start_debug_session`, `snapshot`, `diagnose_crash`) replace multi-step workflows with single calls.
+- **Session startup is ordered:** start server → attach GDB client → resume target → connect RTT. The GDB server halts the core on attach, and RTT discovery before firmware initialization can leave the stream silent.
+- **Failed startup is cleaned up:** if this call started the server but GDB attach fails, it stops that server before returning; an already-running server is left available for an explicit reconnect.
+- **Session teardown is single-owner:** stop clears debug state, disconnects GDB and RTT, then stops the server. The extension and MCP server share the same `GDBServerManager` lifecycle implementation.
+- **GDB transport is explicit:** J-Link and OpenOCD use TCP; Black Magic Probe uses its built-in serial GDB endpoint, so the generic TCP `gdb_connect` tool rejects BMP.
 - **Fault decoding** is automatic — reads CFSR/HFSR/MMFAR/BFAR and explains each bit.
 - **`rtt_search`** lets you find errors without reading the entire log.
 - **Peripheral registers** decode through the vendor's own CMSIS-SVD, so the
@@ -530,7 +538,7 @@ so a fast unit tier replays real device bytes in seconds on any machine —
 no probe required to catch a format regression.
 
 ```bash
-npm test          # ~257 tests, seconds, no hardware
+npm test          # 321 tests, seconds, no hardware
 npm run test:hil  # hardware tier; needs HIL=1 and a probe
 ```
 

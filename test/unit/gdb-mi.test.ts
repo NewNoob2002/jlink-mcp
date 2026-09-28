@@ -113,3 +113,15 @@ describe("REMOTE_LOSS_PATTERNS", () => {
     assert.ok(isRemoteLoss("Cannot execute this command without a live selected thread."));
   });
 });
+
+test("explicit disconnect does not leave an auto-reconnect path", async () => {
+  const client = new GDBClient();
+  (client as any).lastConnectParams = { host: "localhost", port: 2331 };
+  (client as any).targetRunning = true;
+
+  client.disconnect();
+
+  const result = await client.command("info registers");
+  assert.equal(result.success, false);
+  assert.match(result.error ?? "", /GDB not connected/);
+});

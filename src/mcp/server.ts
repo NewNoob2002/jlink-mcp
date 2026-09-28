@@ -35,6 +35,8 @@ export class JLinkMcpServer {
     this.probe.setGdbBridge(this.gdb);
     const effectiveRttPort = rttPort ?? this.probe.getRTTPort();
     this.rttClient = new RTTClient("localhost", effectiveRttPort > 0 ? effectiveRttPort : 19021);
+    this.rttClient.on("connected", () => { this.probe.rttConnected = true; });
+    this.rttClient.on("disconnected", () => { this.probe.rttConnected = false; });
     this.telnetProxy = new TelnetProxy(
       telnetConfig?.listenPort ?? 19400,
       telnetConfig?.sourceHost ?? "localhost",
@@ -281,16 +283,30 @@ export class JLinkMcpServer {
       async () => {
         const guard = this.requireDevice();
         if (guard) return guard;
-        await this.ensureGdbSession();
         const steps: string[] = [];
+        let startedHere = false;
 
         if (!probe.isGDBServerRunning()) {
           const gdbResult = await probe.startGDBServer();
           steps.push(gdbResult.success ? `GDB Server: started (${probe.displayName})` : `GDB Server: ${gdbResult.message}`);
           if (!gdbResult.success) return { content: [{ type: "text", text: steps.join("\n") }] };
+          startedHere = true;
           await sleep(2000);
         } else {
           steps.push("GDB Server: already running");
+        }
+
+        const session = await this.ensureGdbSession();
+        if (!session.ok) {
+          if (startedHere) {
+            this.gdb.disconnect();
+            this.rttClient.disconnect();
+            probe.rttConnected = false;
+            probe.stopGDBServer();
+            steps.push("GDB Server: stopped after GDB session failure");
+          }
+          steps.push(`GDB session failed: ${session.detail}`);
+          return { content: [{ type: "text", text: steps.join("\n") }] };
         }
 
         // The GDB server halts the core when it attaches. Leaving it that way
@@ -313,7 +329,6 @@ export class JLinkMcpServer {
             steps.push(didResume
               ? "Target: resumed (the GDB server halts the core when it attaches)"
               : "Target: could not resume — RTT may stay silent");
-            probe.rttConnected = true;
             steps.push(`RTT: connected (port ${probe.getRTTPort()})`);
             await sleep(1500);
           } catch (err) {
@@ -902,13 +917,26 @@ export class JLinkMcpServer {
     // ═══════════════════════════════════════════════════════════════
 
     this.server.tool("gdb_server_start", `Start ${probe.displayName} GDB server`, {},
-      async () => { const g = this.requireDevice(); if (g) return g;
-        await this.ensureGdbSession(); const r = await probe.startGDBServer(); return { content: [{ type: "text", text: r.message }] }; }
+      async () => {
+        const g = this.requireDevice(); if (g) return g;
+        const wasRunning = probe.isGDBServerRunning();
+        const r = await probe.startGDBServer();
+        if (!r.success) return { content: [{ type: "text", text: r.message }] };
+        const session = await this.ensureGdbSession();
+        if (session.ok) return { content: [{ type: "text", text: r.message }] };
+        if (!wasRunning) {
+          this.gdb.disconnect();
+          probe.stopGDBServer();
+          return { content: [{ type: "text", text: `${r.message}\nGDB session failed: ${session.detail}\nGDB Server stopped after GDB session failure` }] };
+        }
+        return { content: [{ type: "text", text: `${r.message}\nGDB session failed: ${session.detail}` }] };
+      }
     );
 
     this.server.tool("gdb_server_stop", `Stop ${probe.displayName} GDB server and disconnect RTT`, {},
       async () => {
         const cleared = this.gdb.isConnected() ? await this.clearDebugState() : "";
+        this.gdb.disconnect();
         this.rttClient.disconnect();
         probe.rttConnected = false;
         const r = probe.stopGDBServer();
@@ -936,10 +964,12 @@ export class JLinkMcpServer {
         port: z.number().optional().describe("GDB server port (default: 2331)"),
       },
       async ({ elfFile, host, port }) => {
+        if (probe.getGdbTransport() !== "tcp") {
+          return { content: [{ type: "text", text: `${probe.displayName} exposes GDB over serial; the generic TCP GDB client is not available for this backend.` }] };
+        }
         // Auto-start GDB server if not running
         if (!probe.isGDBServerRunning()) {
           const g = this.requireDevice(); if (g) return g;
-        await this.ensureGdbSession();
           const startResult = await probe.startGDBServer();
           if (!startResult.success) return { content: [{ type: "text", text: `Failed to start GDB server: ${startResult.message}` }] };
           await sleep(2000); // Wait for server to bind port
@@ -1068,9 +1098,8 @@ export class JLinkMcpServer {
         if (!probe.isGDBServerRunning()) return { content: [{ type: "text", text: "GDB server must be running for RTT. Use start_debug_session or gdb_server_start first." }] };
         try {
           this.rttClient.clearBuffer();
-          await this.rttClient.connect();
-          probe.rttConnected = true;
-          return { content: [{ type: "text", text: "Connected to RTT" }] };
+          const result = await this.connectRttToRunningTarget();
+          return { content: [{ type: "text", text: `Connected to RTT${result.note}` }] };
         }
         catch (err) { probe.rttConnected = false; return { content: [{ type: "text", text: `Failed: ${err instanceof Error ? err.message : String(err)}` }] }; }
       }
@@ -1296,6 +1325,7 @@ export class JLinkMcpServer {
           device: probe.getDeviceName(),
           deviceConfigured: probe.isDeviceConfigured(),
           supportsRTT: probe.supportsRTT(),
+          gdbTransport: probe.getGdbTransport(),
           gdbServer: probe.getGDBServerStatus(),
         }, null, 2) }] };
       }
@@ -1520,14 +1550,17 @@ export class JLinkMcpServer {
    * would drop the RTT stream on every single control operation, which is a
    * worse answer to the same question.
    */
-  private async ensureGdbSession(): Promise<void> {
-    if (!this.probe.isGDBServerRunning()) return;
-    if (this.gdb.isConnected()) return;
+  private async ensureGdbSession(): Promise<{ ok: boolean; detail?: string }> {
+    if (this.probe.getGdbTransport() !== "tcp") return { ok: true };
+    if (!this.probe.isGDBServerRunning()) return { ok: true };
+    if (this.gdb.isConnected()) return { ok: true };
     try {
-      await this.gdb.connect("localhost", this.probe.getGDBServerStatus().gdbPort);
-    } catch {
-      // Best-effort. If it fails the caller still gets the JLinkExe path,
-      // which is the behaviour they had before.
+      const result = await this.gdb.connect("localhost", this.probe.getGDBServerStatus().gdbPort);
+      return result.success
+        ? { ok: true }
+        : { ok: false, detail: result.error || result.output || "GDB did not connect" };
+    } catch (err) {
+      return { ok: false, detail: err instanceof Error ? err.message : String(err) };
     }
   }
 
@@ -1551,11 +1584,17 @@ export class JLinkMcpServer {
    * a third.
    */
   private async connectRttToRunningTarget(): Promise<{ resumed: boolean; note: string }> {
+    const session = await this.ensureGdbSession();
+    if (!session.ok) throw new Error(session.detail);
+
     const resumed = await this.probe.resume();
+    if (!resumed.success) {
+      this.probe.rttConnected = false;
+      throw new Error(resumed.error || resumed.output || "could not resume target");
+    }
     // Give the firmware time to reach its RTT init before the scan happens.
     await sleep(500);
     await this.rttClient.connect();
-    this.probe.rttConnected = true;
 
     // Connecting our telnet client is not the same as the probe collecting.
     // J-Link scans for the control block once, at its own moment, and after a
@@ -1570,12 +1609,13 @@ export class JLinkMcpServer {
     // stream may well be fine — the scan usually does land.
     // Needs a GDB client, since the restart has to travel to the GDB server
     // that owns the RTT port rather than to a JLinkExe of our own.
-    await this.ensureGdbSession();
-    await this.probe.restartRTT();
+    const restarted = await this.probe.restartRTT();
+    this.probe.rttConnected = this.rttClient.isConnected();
+    if (!this.probe.rttConnected) throw new Error("RTT disconnected during recovery");
 
     return {
       resumed: resumed.success,
-      note: resumed.success ? "" : " (warning: could not resume the target, so RTT may stay silent)",
+      note: restarted.ok ? "" : ` (RTT recovery note: ${restarted.detail})`,
     };
   }
 

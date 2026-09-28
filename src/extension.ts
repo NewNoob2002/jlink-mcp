@@ -141,7 +141,7 @@ export function activate(context: vscode.ExtensionContext) {
   // ── Core services for extension UI ───────────────────────────────
   processManager = new ProcessManager();
   const config = getConfig();
-  gdbServer = new GDBServerManager(processManager);
+  gdbServer = new GDBServerManager(processManager, () => getConfig().jlink);
   rttClient = new RTTClient("localhost", config.jlink.rttTelnetPort);
   telnetProxy = new TelnetProxy(
     config.telnetProxy.listenPort,
@@ -214,8 +214,8 @@ export function activate(context: vscode.ExtensionContext) {
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand("jlinkMcp.startGdbServer", () => {
-      const result = gdbServer!.start();
+    vscode.commands.registerCommand("jlinkMcp.startGdbServer", async () => {
+      const result = await gdbServer!.start();
       if (result.success) {
         vscode.window.showInformationMessage(result.message);
         lastBarText = undefined;   // force the next poll to redraw

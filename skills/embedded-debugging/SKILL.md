@@ -169,8 +169,18 @@ rtt_search {}           # is it logging below your filter?
 
 ## Session hygiene
 
-- `start_debug_session` is one call for GDB server + RTT + boot log. Prefer it
-  over assembling the pieces.
+- `start_debug_session` is one call for GDB server + GDB client + resume + RTT
+  + boot log. The order matters: attaching GDB halts the target, so RTT is
+  connected only after the target has resumed and initialized its control block.
+  Prefer it over assembling the pieces.
+- `gdb_server_stop` clears debug state, disconnects the GDB client and RTT, then
+  stops the server. Use it at the end of a session so the probe is released.
+- If startup reports a GDB attach failure, retry `start_debug_session` or
+  `gdb_server_start`; a server started by that failed call is already cleaned
+  up, while a pre-existing server remains available for `gdb_connect`.
+- Check the reported GDB transport before choosing a client path. J-Link and
+  OpenOCD expose TCP; Black Magic Probe exposes its built-in GDB endpoint over
+  serial and does not accept the generic TCP `gdb_connect` tool.
 - **A probe serves one client at a time.** If something reports the probe busy,
   another GDB server or a stray JLinkExe has it — that is a real constraint,
   not a transient error to retry blindly.

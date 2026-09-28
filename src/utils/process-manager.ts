@@ -38,13 +38,19 @@ export class ProcessManager extends EventEmitter {
 
     proc.on("error", (err) => {
       logError(`Process "${name}" error`, err);
-      this.processes.delete(name);
+      if (this.processes.get(name)?.process === proc) {
+        this.processes.delete(name);
+      }
       this.emit("processExit", name, null, err);
     });
 
     proc.on("exit", (code, signal) => {
       log(`Process "${name}" exited (code=${code}, signal=${signal})`);
-      this.processes.delete(name);
+      // A restart can replace this entry before the old child exits. Do not
+      // let the old child's callback remove the new child from the map.
+      if (this.processes.get(name)?.process === proc) {
+        this.processes.delete(name);
+      }
       this.emit("processExit", name, code, signal);
     });
 

@@ -2,6 +2,7 @@ import { spawn } from "child_process";
 import { ProbeBackend, ProbeState, ProbeErrorCode, CommandResult, GDBServerInfo, parseLittleEndian32 } from "./backend";
 import { ProcessManager } from "../utils/process-manager";
 import { log, logError, logRaw } from "../utils/logger";
+import { GDBServerManager } from "../jlink/gdb-server";
 import * as path from "path";
 import * as fs from "fs";
 import * as os from "os";
@@ -35,8 +36,6 @@ export interface JLinkConfig {
   rttControlBlockAddress?: number;
   swoTelnetPort: number;
 }
-
-const GDB_SERVER_PROCESS = "jlink-gdb-server";
 
 // Lines that are JLink connection boilerplate
 const BOILERPLATE_PATTERNS = [
@@ -87,10 +86,9 @@ export class JLinkBackend extends ProbeBackend {
 
   private config: JLinkConfig;
   private processManager: ProcessManager;
+  private gdbServer: GDBServerManager;
   /** ExpDevList output, parsed once — the list is compiled into the DLL. */
   private deviceCatalog: SupportedDevice[] | null = null;
-
-  private gdbOutputBuffer: string[] = [];
 
   constructor(config: Partial<JLinkConfig>, processManager: ProcessManager) {
     super();
@@ -106,15 +104,11 @@ export class JLinkBackend extends ProbeBackend {
       rttControlBlockAddress: config.rttControlBlockAddress,
       swoTelnetPort: config.swoTelnetPort || 2332,
     };
+    this.gdbServer = new GDBServerManager(processManager, () => this.config);
   }
 
   private get jlinkExe(): string {
     const exe = process.platform === "win32" ? "JLink.exe" : "JLinkExe";
-    return this.config.installDir ? path.join(this.config.installDir, exe) : exe;
-  }
-
-  private get gdbServerExe(): string {
-    const exe = process.platform === "win32" ? "JLinkGDBServerCL.exe" : "JLinkGDBServerCLExe";
     return this.config.installDir ? path.join(this.config.installDir, exe) : exe;
   }
 
@@ -247,24 +241,26 @@ export class JLinkBackend extends ProbeBackend {
   }
 
   /**
-   * Override preflight to use execRaw directly (avoids deadlock since
-   * preflight is called inside acquireLock from withPreflight).
+   * Override preflight to use execRaw directly, while keeping the check
+   * serialized with other J-Link commands.
    */
   async preflight(): Promise<CommandResult | null> {
-    const result = await this.execRaw([`mem 0xE000EDF0, 4`]);
-    if (!result.success) {
-      return {
-        success: false,
-        rawOutput: result.rawOutput,
-        output: "Preflight failed: cannot read DHCSR. Target may be unreachable.",
-        error: result.error,
-        errorCode: ProbeErrorCode.TARGET_UNREACHABLE,
-        lastSuccessfulStage: "probe_connected",
-        suggestedAction: "Try reset with halt, reduce SWD speed, or power cycle.",
-      };
-    }
-    this.setState(ProbeState.TARGET_ATTACHED);
-    return null;
+    return this.acquireLock(async () => {
+      const result = await this.execRaw([`mem 0xE000EDF0, 4`]);
+      if (!result.success) {
+        return {
+          success: false,
+          rawOutput: result.rawOutput,
+          output: "Preflight failed: cannot read DHCSR. Target may be unreachable.",
+          error: result.error,
+          errorCode: ProbeErrorCode.TARGET_UNREACHABLE,
+          lastSuccessfulStage: "probe_connected",
+          suggestedAction: "Try reset with halt, reduce SWD speed, or power cycle.",
+        };
+      }
+      this.setState(ProbeState.TARGET_ATTACHED);
+      return null;
+    });
   }
 
   // ── ProbeBackend implementation ──────────────────────────────────
@@ -285,7 +281,7 @@ export class JLinkBackend extends ProbeBackend {
   private useGdb(): boolean {
     const optOut = process.env.JLINK_MCP_GDB_ROUTING;
     if (optOut === "0" || optOut?.toLowerCase() === "false") return false;
-    return !!this.gdbBridge?.isConnected();
+    return !!this.gdbBridge && (this.gdbBridge.isConnected() || this.isGDBServerRunning());
   }
 
   /**
@@ -326,7 +322,11 @@ export class JLinkBackend extends ProbeBackend {
   }
 
   async getDeviceInfo(): Promise<CommandResult> {
-    if (this.useGdb()) return this.runViaGdb("info registers");
+    if (this.useGdb()) {
+      const halted = await this.halt();
+      if (!halted.success) return halted;
+      return this.runViaGdb("info registers");
+    }
     return this.withPreflight("getDeviceInfo", () => this.execRaw(["halt", "regs"]));
   }
   async halt(): Promise<CommandResult> {
@@ -671,165 +671,29 @@ export class JLinkBackend extends ProbeBackend {
   // ── GDB Server ───────────────────────────────────────────────────
 
   async startGDBServer(): Promise<{ success: boolean; message: string }> {
-    if (this.processManager.get(GDB_SERVER_PROCESS)) {
-      return { success: true, message: "GDB Server is already running" };
-    }
-
-    const args = [
-      "-device", this.config.device,
-      "-if", this.config.interface,
-      "-speed", String(this.config.speed),
-      "-port", String(this.config.gdbPort),
-      "-RTTTelnetPort", String(this.config.rttTelnetPort),
-      "-SWOPort", String(this.config.swoTelnetPort),
-      // Note: `-singlerun` is intentionally NOT set. That flag makes
-      // JLinkGDBServer exit the moment the target is reset or the GDB
-      // client disconnects, which caused control-plane desync — the
-      // child GDB process would still think it was connected while the
-      // remote socket was dead, producing "monitor command not supported"
-      // and "program has no registers now" errors. We manage server
-      // lifetime explicitly via `stopGDBServer()` / `dispose()`.
-      "-vd", "-noir", "-LocalhostOnly", "1", "-NoGui", "1",
-    ];
-    if (this.config.serialNumber) args.push("-select", `USB=${this.config.serialNumber}`);
-
-    // Retry a probe that is busy. The usual cause is the previous session's
-    // server: killed a moment ago, but the USB device is not free the instant
-    // the process is signalled. One suite tearing down and the next starting
-    // 2.2 s later was enough to lose the probe for an entire suite.
-    let lastDetail = "";
-    for (let attempt = 1; attempt <= 3; attempt++) {
-      try {
-        const managed = this.processManager.spawn(GDB_SERVER_PROCESS, this.gdbServerExe, args);
-        managed.process.stdout?.on("data", (d: Buffer) => {
-          for (const line of d.toString().split("\n").filter(Boolean)) {
-            log(`[GDB Server] ${line}`);
-            this.gdbOutputBuffer.push(line);
-            if (this.gdbOutputBuffer.length > 1000) this.gdbOutputBuffer.shift();
-          }
-        });
-        managed.process.stderr?.on("data", (d: Buffer) => {
-          for (const line of d.toString().split("\n").filter(Boolean)) {
-            logError(`[GDB Server] ${line}`);
-            this.gdbOutputBuffer.push(`[ERR] ${line}`);
-          }
-        });
-
-        // Spawning is not starting. The server takes a moment to claim the
-        // probe, and if another process still holds it, it prints "Connecting
-        // to J-Link failed" and exits ~200 ms later. Returning success on the
-        // spawn alone reported a running server that was already dead, and
-        // the whole suite that followed ran with no GDB server and no RTT.
-        const ready = await this.awaitGdbServerReady(managed);
-        if (ready.ok) {
-          this.setState(ProbeState.GDB_RUNNING);
-          return { success: true, message: `GDB Server started on port ${this.config.gdbPort}, RTT telnet on port ${this.config.rttTelnetPort}` };
-        }
-
-        lastDetail = ready.detail;
-        this.processManager.kill(GDB_SERVER_PROCESS);
-        this.gdbOutputBuffer = [];
-        if (attempt < 3) {
-          log(`[J-Link] GDB Server did not come up (${ready.detail}); retrying (${attempt + 1}/3)`);
-          await new Promise((r) => setTimeout(r, 1500));
-        }
-      } catch (err) {
-        logError("Failed to start GDB Server", err);
-        return { success: false, message: `Failed to start GDB Server: ${err instanceof Error ? err.message : String(err)}` };
-      }
-    }
-
-    this.setState(ProbeState.PROBE_CONNECTED);
-
-    // Report what the server said; only name contention when the evidence
-    // supports it.
-    //
-    // This used to assert "check for another JLinkGDBServer or JLinkExe
-    // holding the probe" on every failure. Measured against a target whose
-    // debug port was unpowered, the server's own words were
-    // "ERROR: Could not connect to target" — and the same output showed
-    // "J-Link is connected" and "Listening on TCP/IP port 2331", i.e. proof
-    // the probe was *not* contended. Someone acting on that message killed
-    // processes for nothing.
-    //
-    // A guess printed with this much confidence is worse than no guess, and
-    // it is exactly what this server keeps being wrong about elsewhere.
-    const contended = /in use|already|another|cannot open|failed to open/i.test(lastDetail);
-    const targetSide = /could not connect to target|no target|target voltage/i.test(lastDetail);
-    return {
-      success: false,
-      message:
-        `GDB Server failed to start after 3 attempts. It said: ${lastDetail}\n` +
-        (targetSide
-          ? "That is a target-side failure: the probe is fine and the chip is not answering. " +
-            "Check target power and the debug connection."
-          : contended
-            ? "A J-Link serves one client at a time; another JLinkGDBServer or JLinkExe may hold it."
-            : "Cause unclear from that message — check the GDB server output via gdb_server_status."),
-    };
-  }
-
-  /**
-   * Wait for the GDB server to claim the probe, or to fail trying.
-   *
-   * Readiness is the server's own "Waiting for GDB connection" banner. The
-   * failure to watch for is the probe being held by someone else — most often
-   * the previous session's server, which had been killed moments earlier but
-   * had not yet released the USB device.
-   */
-  private awaitGdbServerReady(
-    managed: { process: { once(e: string, cb: (...a: any[]) => void): void } },
-    timeoutMs = 15000
-  ): Promise<{ ok: boolean; detail: string }> {
-    return new Promise((resolve) => {
-      let done = false;
-      const finish = (ok: boolean, detail: string) => {
-        if (done) return;
-        done = true;
-        clearInterval(poll);
-        clearTimeout(timer);
-        resolve({ ok, detail });
-      };
-
-      // The output already streams into gdbOutputBuffer, so watch that rather
-      // than adding a second listener that could race with the first.
-      const poll = setInterval(() => {
-        const text = this.gdbOutputBuffer.join("\n");
-        if (/waiting for gdb connection/i.test(text)) return finish(true, "ready");
-        const failure = text.match(/(connecting to j-link failed[^\n]*|could not connect to j-link[^\n]*)/i);
-        if (failure) return finish(false, failure[1].trim());
-      }, 50);
-
-      managed.process.once("exit", (code: number | null) => {
-        const text = this.gdbOutputBuffer.join("\n");
-        const reason = text.match(/(connecting to j-link failed[^\n]*)/i)?.[1];
-        finish(false, reason
-          ? `${reason.trim()} (exit code ${code}). Another process is probably holding the probe.`
-          : `server exited with code ${code} before accepting connections`);
-      });
-
-      const timer = setTimeout(
-        () => finish(false, `no readiness banner within ${timeoutMs} ms`),
-        timeoutMs
-      );
+    return this.acquireLock(async () => {
+      const result = await this.gdbServer.start();
+      if (result.success) this.setState(ProbeState.GDB_RUNNING);
+      else this.setState(ProbeState.PROBE_CONNECTED);
+      return result;
     });
   }
 
   stopGDBServer(): { success: boolean; message: string } {
-    const killed = this.processManager.kill(GDB_SERVER_PROCESS);
-    this.gdbOutputBuffer = [];
+    const result = this.gdbServer.stop();
+    this.gdbBridge?.disconnect?.();
     this.rttConnected = false;
-    if (killed) this.setState(ProbeState.PROBE_CONNECTED);
-    return { success: true, message: killed ? "GDB Server stopped" : "GDB Server was not running" };
+    if (this.state === ProbeState.GDB_RUNNING) this.setState(ProbeState.PROBE_CONNECTED);
+    return result;
   }
 
-  isGDBServerRunning(): boolean { return !!this.processManager.get(GDB_SERVER_PROCESS); }
+  isGDBServerRunning(): boolean { return this.gdbServer.isRunning(); }
 
   getGDBServerStatus(): GDBServerInfo {
-    return { running: this.isGDBServerRunning(), gdbPort: this.config.gdbPort, rttTelnetPort: this.config.rttTelnetPort };
+    return { running: this.isGDBServerRunning(), gdbPort: this.config.gdbPort, rttTelnetPort: this.config.rttTelnetPort, transport: "tcp" };
   }
 
-  getGDBServerOutput(lines = 50): string[] { return this.gdbOutputBuffer.slice(-lines); }
+  getGDBServerOutput(lines = 50): string[] { return this.gdbServer.getRecentOutput(lines); }
 
   // ── Device configuration ─────────────────────────────────────────
 
@@ -861,7 +725,7 @@ export class JLinkBackend extends ProbeBackend {
   async listDevices(): Promise<CommandResult> {
     // Run ShowEmuList without specifying a device to see connected probes
     const args = ["-NoGui", "1"];
-    return new Promise<CommandResult>((resolve) => {
+    return this.acquireLock(() => new Promise<CommandResult>((resolve) => {
       const proc = spawn(this.jlinkExe, args, { stdio: ["pipe", "pipe", "pipe"] });
       let stdout = "", stderr = "";
       proc.stdout?.on("data", (d: Buffer) => { stdout += d.toString(); });
@@ -875,7 +739,7 @@ export class JLinkBackend extends ProbeBackend {
         resolve({ success: code === 0, rawOutput: stdout, output: stripBoilerplate(stdout), error: stderr || undefined });
       });
       setTimeout(() => { proc.kill("SIGTERM"); resolve({ success: false, rawOutput: stdout, output: stdout, error: "Timed out" }); }, 10000);
-    });
+    }));
   }
 
   // ── RTT ──────────────────────────────────────────────────────────
@@ -1108,7 +972,8 @@ export class JLinkBackend extends ProbeBackend {
   // ── Lifecycle ────────────────────────────────────────────────────
 
   dispose(): void {
-    this.processManager.kill(GDB_SERVER_PROCESS);
+    this.gdbBridge?.disconnect?.();
+    this.gdbServer.stop();
     this.setState(ProbeState.DISCONNECTED);
   }
 }

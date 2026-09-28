@@ -139,6 +139,7 @@ export class GDBClient {
   /** Minimum delay between commands to avoid overwhelming slow adapters */
   private lastCommandTime = 0;
   private commandThrottleMs = 50;
+  private connectPromise: Promise<GDBResponse> | null = null;
 
   constructor(gdbPath: string = "arm-none-eabi-gdb") {
     this.gdbPath = gdbPath;
@@ -181,8 +182,24 @@ export class GDBClient {
    * auto-reconnect path in `command()`.
    */
   async connect(host: string = "localhost", port: number = 2331, elfFile?: string): Promise<GDBResponse> {
+    if (this.connectPromise) return this.connectPromise;
+    const promise = this.connectInternal(host, port, elfFile);
+    this.connectPromise = promise;
+    try {
+      return await promise;
+    } finally {
+      if (this.connectPromise === promise) this.connectPromise = null;
+    }
+  }
+
+  private async connectInternal(host: string, port: number, elfFile?: string): Promise<GDBResponse> {
     if (this.connected && this.proc) {
       return { success: true, output: "GDB already connected" };
+    }
+
+    if (this.proc) {
+      try { this.proc.kill("SIGTERM"); } catch { /* stale child */ }
+      this.proc = null;
     }
 
     const args = ["--interpreter=mi2", "--quiet", "--nx"];
@@ -191,32 +208,50 @@ export class GDBClient {
     log(`[GDB] Starting: ${this.gdbPath} ${args.join(" ")}`);
 
     return new Promise((resolve) => {
-      this.proc = spawn(this.gdbPath, args, {
+      let settled = false;
+      const finish = (result: GDBResponse) => {
+        if (settled) return;
+        settled = true;
+        resolve(result);
+      };
+      const proc = spawn(this.gdbPath, args, {
         stdio: ["pipe", "pipe", "pipe"],
       });
+      this.proc = proc;
 
       this.outputBuffer = "";
       this.stopEvent = null;
+      // A fresh remote attach starts from a stopped, synchronized state. Do
+      // not carry the old connection's run flag into an automatic reconnect:
+      // it would refuse the first real command as if the target were still
+      // running even though the new server session halted it on attach.
+      this.targetRunning = false;
+      this.resumeAfterHostCommand = false;
 
-      this.proc.stdout?.on("data", (data: Buffer) => {
+      proc.stdout?.on("data", (data: Buffer) => {
         this.handleOutput(data.toString());
       });
 
-      this.proc.stderr?.on("data", (data: Buffer) => {
+      proc.stderr?.on("data", (data: Buffer) => {
         const text = data.toString();
         log(`[GDB stderr] ${text.trim()}`);
       });
 
-      this.proc.on("error", (err) => {
+      proc.on("error", (err) => {
         logError("GDB process error", err);
-        this.connected = false;
-        resolve({ success: false, output: "", error: `Failed to start GDB: ${err.message}. Is ${this.gdbPath} installed?` });
+        if (this.proc === proc) {
+          this.connected = false;
+          this.proc = null;
+        }
+        finish({ success: false, output: "", error: `Failed to start GDB: ${err.message}. Is ${this.gdbPath} installed?` });
       });
 
-      this.proc.on("exit", (code) => {
+      proc.on("exit", (code) => {
         log(`[GDB] Process exited with code ${code}`);
-        this.connected = false;
-        this.proc = null;
+        if (this.proc === proc) {
+          this.connected = false;
+          this.proc = null;
+        }
       });
 
       // Wait for GDB to be ready, then connect to remote target
@@ -236,10 +271,18 @@ export class GDBClient {
                 // caller gets an empty response — which reads as a healthy
                 // but silent target rather than as a state mismatch.
                 await this.sendCommand("set mi-async on", 5000).catch(() => "");
-                resolve({ success: true, output: `Connected to GDB server at ${host}:${port}\n${this.cleanMI(connectResult)}` });
+                finish({ success: true, output: `Connected to GDB server at ${host}:${port}\n${this.cleanMI(connectResult)}` });
               } else {
-                resolve({ success: false, output: this.cleanMI(connectResult), error: "Failed to connect to GDB server" });
+                this.connected = false;
+                if (this.proc === proc) this.proc = null;
+                try { proc.kill("SIGTERM"); } catch { /* already exited */ }
+                finish({ success: false, output: this.cleanMI(connectResult), error: "Failed to connect to GDB server" });
               }
+            }, (err) => {
+              this.connected = false;
+              if (this.proc === proc) this.proc = null;
+              try { proc.kill("SIGTERM"); } catch { /* already exited */ }
+              finish({ success: false, output: "", error: String(err) });
             });
           }
         }, 100);
@@ -248,7 +291,9 @@ export class GDBClient {
         setTimeout(() => {
           clearInterval(checkInterval);
           if (!this.connected) {
-            resolve({ success: false, output: this.outputBuffer, error: `GDB did not start within timeout. Output: ${this.outputBuffer.slice(0, 200)}` });
+            if (this.proc === proc) this.proc = null;
+            try { proc.kill("SIGTERM"); } catch { /* already exited */ }
+            finish({ success: false, output: this.outputBuffer, error: `GDB did not start within timeout. Output: ${this.outputBuffer.slice(0, 200)}` });
           }
         }, 8000);
       };
@@ -297,6 +342,10 @@ export class GDBClient {
     // target stops, so waiting on it buys nothing but a timeout — and a
     // timeout returns empty output, which reads like a healthy quiet target
     // rather than "you need to halt first".
+    if (this.targetRunning && /^\s*(continue|c|run)\b/i.test(cmd)) {
+      return { success: true, output: "Target already running" };
+    }
+
     if (this.targetRunning && !(await this.pauseFor(cmd))) {
       // Log the refusal. A command that never reaches GDB is also never
       // logged by sendCommand, so a whole refused sequence leaves no trace at
@@ -327,9 +376,8 @@ export class GDBClient {
     // through this MCP should use the `halt` tool or send
     // `monitor halt` — both go through the JLinkGDBServer monitor
     // command channel, which bypasses GDB's execution state machine.
-    // Enabling `mi-async` at connect time to make interrupt work
-    // natively is deferred to a follow-up (it interacts with the
-    // response-detection state machine and needs care).
+    // `mi-async` is enabled during connect, but the synchronous remote still
+    // needs the SIGINT path above for a reliable halt while it is running.
     this.stopEvent = null;
     const rawOutput = await this.sendCommand(cmd, isRunCommand ? timeout : 10000, isRunCommand);
     logRaw("gdb", cmd, rawOutput);
@@ -505,12 +553,13 @@ export class GDBClient {
 
   /** Disconnect and kill GDB process */
   disconnect(): void {
-    if (this.proc) {
+    const proc = this.proc;
+    if (proc) {
       try {
-        this.proc.stdin?.write("quit\n");
+        proc.stdin?.write("quit\n");
       } catch { /* ignore */ }
       setTimeout(() => {
-        try { this.proc?.kill("SIGTERM"); } catch { /* ignore */ }
+        try { proc.kill("SIGTERM"); } catch { /* ignore */ }
       }, 1000);
       this.proc = null;
     }
@@ -519,6 +568,10 @@ export class GDBClient {
     this.pending = null;
     this.stopEvent = null;
     this.targetRunning = false;
+    // An explicit disconnect must stay disconnected. Keep auto-reconnect for
+    // remote loss, but discard it when the caller deliberately tears down the
+    // session.
+    this.lastConnectParams = null;
   }
 
   // ── Internal ─────────────────────────────────────────────────────

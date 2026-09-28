@@ -32,12 +32,14 @@ losing data:
   removing the stack dump from `snapshot` and both the CPU State and
   Exception Stack Frame sections from `diagnose_crash`.
 
-## Tier 2 — hardware-in-the-loop (`test/hil/`) — not built yet
+## Tier 2 — hardware-in-the-loop (`test/hil/`)
 
 Drives the real `out/mcp/standalone.js` over stdio with an MCP client against
-an nRF52840-DK on a self-hosted runner. Planned suites S0–S11 cover discovery,
-flash, halt/inspect/resume, memory and peripherals, breakpoints, RTT, crash
-diagnosis, recovery, and session lifecycle.
+an nRF52840-DK on a self-hosted runner. Suites S0–S11 cover discovery, flash,
+halt/inspect/resume, memory and peripherals, breakpoints, RTT, crash diagnosis,
+recovery, and session lifecycle. Target-specific smoke tests should use the
+same MCP surface but must not assume the nRF52840 fixture or flash it onto a
+different board.
 
 The HIL tier's other job is to **capture** golden transcripts. Anything it
 parses gets written back to `test/golden/`, so real device output becomes the

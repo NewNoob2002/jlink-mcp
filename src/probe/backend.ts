@@ -57,6 +57,8 @@ export interface GDBServerInfo {
   gdbPort: number;
   /** Port for RTT telnet access (J-Link specific, -1 if not supported) */
   rttTelnetPort: number;
+  /** Transport used by the probe's GDB endpoint. */
+  transport?: GdbTransport;
   rttControlBlockAddress?: number;
 }
 
@@ -70,6 +72,7 @@ export interface ProbeStatus {
 }
 
 export type ProbeType = "jlink" | "openocd" | "blackmagic" | "probe-rs";
+export type GdbTransport = "tcp" | "serial";
 
 /**
  * Minimal surface a backend needs to route CPU-control and read commands
@@ -82,6 +85,7 @@ export type ProbeType = "jlink" | "openocd" | "blackmagic" | "probe-rs";
  */
 export interface GdbBridge {
   isConnected(): boolean;
+  disconnect?(): void;
   command(cmd: string, timeout?: number): Promise<{
     success: boolean;
     output: string;
@@ -225,22 +229,40 @@ export abstract class ProbeBackend {
     fn: () => Promise<CommandResult>,
     skipPreflight = false
   ): Promise<CommandResult> {
-    return this.acquireLock(async () => {
-      if (!skipPreflight && this.isDeviceConfigured()) {
-        const check = await this.preflight();
-        if (check) {
-          // Try recovery once
-          const recovered = await this.recover();
-          if (!recovered) {
-            return {
-              ...check,
-              lastSuccessfulStage: "recovery_attempted",
-              suggestedAction: `Recovery failed. Try: 1) reset with halt, 2) power cycle the target, 3) check SWD wiring. Operation was: ${operation}`,
-            };
-          }
+    if (
+      !skipPreflight &&
+      this.getGdbTransport() === "tcp" &&
+      this.isGDBServerRunning() &&
+      this.gdbBridge &&
+      !this.gdbBridge.isConnected()
+    ) {
+      return {
+        success: false,
+        rawOutput: "",
+        output: "",
+        error: "GDB server is running but the GDB client is not connected.",
+        errorCode: ProbeErrorCode.GDB_SERVER_FAILED,
+        suggestedAction: "Reconnect with gdb_connect before issuing target commands.",
+      };
+    }
+
+    if (!skipPreflight && this.isDeviceConfigured()) {
+      const check = await this.preflight();
+      if (check) {
+        // Recovery is serialized separately because preflight itself may use
+        // a backend method that acquires this same lock.
+        const recovered = await this.acquireLock(() => this.recover());
+        if (!recovered) {
+          return {
+            ...check,
+            lastSuccessfulStage: "recovery_attempted",
+            suggestedAction: `Recovery failed. Try: 1) reset with halt, 2) power cycle the target, 3) check SWD wiring. Operation was: ${operation}`,
+          };
         }
       }
+    }
 
+    return this.acquireLock(async () => {
       const result = await fn();
 
       // Update state based on result
@@ -336,6 +358,9 @@ export abstract class ProbeBackend {
   }
   abstract getGDBServerStatus(): GDBServerInfo;
   abstract getGDBServerOutput(lines?: number): string[];
+
+  /** How the generic MCP GDB client can reach this backend. */
+  getGdbTransport(): GdbTransport { return "tcp"; }
 
   // ── Raw commands ─────────────────────────────────────────────────
 

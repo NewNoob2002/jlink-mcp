@@ -39,20 +39,7 @@ export class BlackMagicBackend extends ProbeBackend {
   }
 
   /** Execute GDB commands against the Black Magic Probe */
-  private async gdbExec(gdbCommands: string[]): Promise<CommandResult> {
-    const fullCommands = [
-      `target extended-remote ${this.config.serialPort}`,
-      "monitor version",
-      `monitor swdp_scan`,
-      `attach ${this.config.targetIndex}`,
-      ...gdbCommands,
-      "detach",
-      "quit",
-    ];
-
-    // Write commands to a temp batch
-    const batchContent = fullCommands.join("\n");
-
+  private gdbExec(gdbCommands: string[]): Promise<CommandResult> {
     const args = [
       "--batch",
       "--nx",
@@ -67,7 +54,7 @@ export class BlackMagicBackend extends ProbeBackend {
 
     log(`[BMP] ${gdbCommands.join("; ")}`);
 
-    return new Promise<CommandResult>((resolve) => {
+    return this.acquireLock(() => new Promise<CommandResult>((resolve) => {
       const proc = spawn(this.config.gdbPath, args, { stdio: ["pipe", "pipe", "pipe"] });
       let stdout = "", stderr = "";
 
@@ -81,7 +68,7 @@ export class BlackMagicBackend extends ProbeBackend {
       });
 
       setTimeout(() => { proc.kill("SIGTERM"); resolve({ success: false, rawOutput: stdout, output: stdout, error: "GDB timed out" }); }, 30000);
-    });
+    }));
   }
 
   // ── ProbeBackend implementation ──────────────────────────────────
@@ -149,8 +136,10 @@ export class BlackMagicBackend extends ProbeBackend {
   }
 
   getGDBServerStatus(): GDBServerInfo {
-    return { running: true, gdbPort: 0, rttTelnetPort: -1 };
+    return { running: true, gdbPort: 0, rttTelnetPort: -1, transport: "serial" };
   }
+
+  getGdbTransport(): "serial" { return "serial"; }
 
   getGDBServerOutput(_lines = 50): string[] { return ["BMP uses built-in GDB server on serial port"]; }
 

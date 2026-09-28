@@ -76,7 +76,8 @@ export class OpenOCDBackend extends ProbeBackend {
 
   /** Execute OpenOCD commands. If server is running, uses telnet. Otherwise spawns a one-shot process. */
   private async exec(ocdCommands: string[]): Promise<CommandResult> {
-    if (this.isGDBServerRunning()) {
+    return this.acquireLock(async () => {
+      if (this.isGDBServerRunning()) {
       // Use telnet interface
       try {
         const results: string[] = [];
@@ -89,20 +90,20 @@ export class OpenOCDBackend extends ProbeBackend {
       } catch (err) {
         return { success: false, rawOutput: "", output: "", error: `Telnet error: ${err instanceof Error ? err.message : String(err)}` };
       }
-    }
+      }
 
-    // One-shot: spawn openocd with -c commands
-    const args = this.buildConfigArgs();
-    for (const cmd of ocdCommands) {
-      args.push("-c", cmd);
-    }
-    args.push("-c", "shutdown");
+      // One-shot: spawn openocd with -c commands
+      const args = this.buildConfigArgs();
+      for (const cmd of ocdCommands) {
+        args.push("-c", cmd);
+      }
+      args.push("-c", "shutdown");
 
-    log(`[OpenOCD] ${ocdCommands.join("; ")}`);
+      log(`[OpenOCD] ${ocdCommands.join("; ")}`);
 
-    return new Promise<CommandResult>((resolve) => {
-      const proc = spawn(this.config.binaryPath, args, { stdio: ["pipe", "pipe", "pipe"] });
-      let stdout = "", stderr = "";
+      return new Promise<CommandResult>((resolve) => {
+        const proc = spawn(this.config.binaryPath, args, { stdio: ["pipe", "pipe", "pipe"] });
+        let stdout = "", stderr = "";
 
       proc.stdout?.on("data", (d: Buffer) => { stdout += d.toString(); });
       proc.stderr?.on("data", (d: Buffer) => { stderr += d.toString(); });
@@ -115,7 +116,8 @@ export class OpenOCDBackend extends ProbeBackend {
         resolve({ success: code === 0, rawOutput: combined, output: combined, error: code !== 0 ? stderr : undefined });
       });
 
-      setTimeout(() => { proc.kill("SIGTERM"); resolve({ success: false, rawOutput: stdout, output: stdout, error: "OpenOCD timed out" }); }, 30000);
+        setTimeout(() => { proc.kill("SIGTERM"); resolve({ success: false, rawOutput: stdout, output: stdout, error: "OpenOCD timed out" }); }, 30000);
+      });
     });
   }
 
@@ -184,38 +186,41 @@ export class OpenOCDBackend extends ProbeBackend {
   // ── GDB Server ───────────────────────────────────────────────────
 
   async startGDBServer(): Promise<{ success: boolean; message: string }> {
-    if (this.processManager.get(OPENOCD_PROCESS)) {
-      return { success: true, message: "OpenOCD is already running" };
-    }
+    return this.acquireLock(async () => {
+      if (this.processManager.get(OPENOCD_PROCESS)) {
+        return { success: true, message: "OpenOCD is already running" };
+      }
 
-    const args = this.buildConfigArgs();
-    args.push("-c", `gdb_port ${this.config.gdbPort}`);
-    args.push("-c", `telnet_port ${this.config.telnetPort}`);
-    args.push("-c", `tcl_port ${this.config.tclPort}`);
+      const args = this.buildConfigArgs();
+      args.push("-c", `gdb_port ${this.config.gdbPort}`);
+      args.push("-c", `telnet_port ${this.config.telnetPort}`);
+      args.push("-c", `tcl_port ${this.config.tclPort}`);
 
-    try {
-      const managed = this.processManager.spawn(OPENOCD_PROCESS, this.config.binaryPath, args);
-      managed.process.stdout?.on("data", (d: Buffer) => {
-        for (const line of d.toString().split("\n").filter(Boolean)) {
-          log(`[OpenOCD] ${line}`);
-          this.gdbOutputBuffer.push(line);
-          if (this.gdbOutputBuffer.length > 1000) this.gdbOutputBuffer.shift();
-        }
-      });
-      managed.process.stderr?.on("data", (d: Buffer) => {
-        for (const line of d.toString().split("\n").filter(Boolean)) {
-          log(`[OpenOCD] ${line}`); // OpenOCD uses stderr for normal output
-          this.gdbOutputBuffer.push(line);
-          if (this.gdbOutputBuffer.length > 1000) this.gdbOutputBuffer.shift();
-        }
-      });
-      return { success: true, message: `OpenOCD started: GDB on port ${this.config.gdbPort}, telnet on port ${this.config.telnetPort}` };
-    } catch (err) {
-      return { success: false, message: `Failed to start OpenOCD: ${err instanceof Error ? err.message : String(err)}` };
-    }
+      try {
+        const managed = this.processManager.spawn(OPENOCD_PROCESS, this.config.binaryPath, args);
+        managed.process.stdout?.on("data", (d: Buffer) => {
+          for (const line of d.toString().split("\n").filter(Boolean)) {
+            log(`[OpenOCD] ${line}`);
+            this.gdbOutputBuffer.push(line);
+            if (this.gdbOutputBuffer.length > 1000) this.gdbOutputBuffer.shift();
+          }
+        });
+        managed.process.stderr?.on("data", (d: Buffer) => {
+          for (const line of d.toString().split("\n").filter(Boolean)) {
+            log(`[OpenOCD] ${line}`); // OpenOCD uses stderr for normal output
+            this.gdbOutputBuffer.push(line);
+            if (this.gdbOutputBuffer.length > 1000) this.gdbOutputBuffer.shift();
+          }
+        });
+        return { success: true, message: `OpenOCD started: GDB on port ${this.config.gdbPort}, telnet on port ${this.config.telnetPort}` };
+      } catch (err) {
+        return { success: false, message: `Failed to start OpenOCD: ${err instanceof Error ? err.message : String(err)}` };
+      }
+    });
   }
 
   stopGDBServer(): { success: boolean; message: string } {
+    this.gdbBridge?.disconnect?.();
     const killed = this.processManager.kill(OPENOCD_PROCESS);
     this.gdbOutputBuffer = [];
     return { success: true, message: killed ? "OpenOCD stopped" : "OpenOCD was not running" };
@@ -224,7 +229,7 @@ export class OpenOCDBackend extends ProbeBackend {
   isGDBServerRunning(): boolean { return !!this.processManager.get(OPENOCD_PROCESS); }
 
   getGDBServerStatus(): GDBServerInfo {
-    return { running: this.isGDBServerRunning(), gdbPort: this.config.gdbPort, rttTelnetPort: -1 };
+    return { running: this.isGDBServerRunning(), gdbPort: this.config.gdbPort, rttTelnetPort: -1, transport: "tcp" };
   }
 
   getGDBServerOutput(lines = 50): string[] { return this.gdbOutputBuffer.slice(-lines); }
@@ -240,5 +245,5 @@ export class OpenOCDBackend extends ProbeBackend {
     return this.exec(["init", "targets"]);
   }
 
-  dispose(): void { this.processManager.kill(OPENOCD_PROCESS); }
+  dispose(): void { this.stopGDBServer(); }
 }
